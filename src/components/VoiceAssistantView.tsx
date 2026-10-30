@@ -165,14 +165,22 @@ export const VoiceAssistantView: React.FC<VoiceAssistantViewProps> = ({
 
   // Check server Gemini API configuration on mount
   useEffect(() => {
-    fetch('/api/live/status')
-      .then((r) => r.json())
-      .then((data) => {
-        setApiConfigured(Boolean(data.configured));
-      })
-      .catch(() => {
-        setApiConfigured(false);
-      });
+    let active = true;
+    (async () => {
+      try {
+        const res = await fetch('/api/live/status');
+        const rawText = await res.text();
+        const data = rawText ? JSON.parse(rawText) : {};
+        if (active && typeof data.configured === 'boolean') {
+          setApiConfigured(data.configured);
+        }
+      } catch {
+        // Do not falsely mark GEMINI_API_KEY as missing if status check encounters a transient network error
+      }
+    })();
+    return () => {
+      active = false;
+    };
   }, []);
 
   // Auto-scroll transcript
@@ -347,30 +355,53 @@ export const VoiceAssistantView: React.FC<VoiceAssistantViewProps> = ({
       return;
     }
 
-    // 2. Request Short-Lived Ephemeral Session Token from Backend
+    // 2. Request Short-Lived Ephemeral Session Token from Backend (/api/live/token)
     setConnectionState('connecting');
-    let sessionToken = '';
+    let tokenData: {
+      token?: string;
+      wsEndpoint?: string;
+      setupPayload?: Record<string, unknown>;
+      model?: string;
+      voiceName?: string;
+      error?: string;
+      code?: string;
+    } = {};
+
     try {
       const tokenRes = await fetch('/api/live/token', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ voiceName: selectedVoice }),
       });
-      const tokenData = await tokenRes.json();
+
+      const rawText = await tokenRes.text();
+      try {
+        tokenData = rawText ? JSON.parse(rawText) : {};
+      } catch {
+        throw new Error(
+          tokenRes.status === 404
+            ? 'Token endpoint (/api/live/token) returned 404 Not Found. Ensure the /api/live serverless functions are deployed on Vercel.'
+            : `Backend returned a non-JSON response (HTTP ${tokenRes.status}). Check your server deployment logs and GEMINI_API_KEY configuration.`
+        );
+      }
+
       if (!tokenRes.ok || !tokenData.token) {
+        if (tokenData.code === 'MISSING_GEMINI_API_KEY') {
+          setApiConfigured(false);
+        }
         throw new Error(
           tokenData.error ||
             'Failed to obtain short-lived Gemini Live session token from backend.'
         );
       }
-      sessionToken = tokenData.token;
+
       setApiConfigured(true);
     } catch (err: any) {
       cleanupSession();
       setConnectionState('error');
       setErrorMessage(
         err?.message ||
-          'Could not generate ephemeral session token. Verify GEMINI_API_KEY in AI Studio Secrets.'
+          'Could not generate ephemeral session token. Verify GEMINI_API_KEY in your environment variables.'
       );
       return;
     }
@@ -378,62 +409,195 @@ export const VoiceAssistantView: React.FC<VoiceAssistantViewProps> = ({
     // 3. Initialize 16kHz Input AudioContext and 24kHz Output AudioContext
     try {
       const AudioCtx =
-        window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext })
+          .webkitAudioContext;
       const inCtx = new AudioCtx({ sampleRate: 16000 });
       const outCtx = new AudioCtx({ sampleRate: 24000 });
       inputAudioCtxRef.current = inCtx;
       outputAudioCtxRef.current = outCtx;
       nextStartTimeRef.current = outCtx.currentTime;
 
-      // 4. Open WebSocket to /live with short-lived token
+      // 4. Connect to Gemini Live WebSocket using the short-lived Ephemeral Token
+      const isDirectConstrained = Boolean(
+        tokenData.wsEndpoint && tokenData.setupPayload
+      );
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${protocol}//${window.location.host}/live?token=${encodeURIComponent(
-        sessionToken
-      )}`;
+      const wsUrl = isDirectConstrained
+        ? (tokenData.wsEndpoint as string)
+        : `${protocol}//${window.location.host}/live?token=${encodeURIComponent(
+            tokenData.token || ''
+          )}`;
+
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
-      ws.onmessage = (event) => {
-        try {
-          const msg = JSON.parse(event.data);
+      let audioStreamingStarted = false;
+      const startMicAudioPipeline = () => {
+        if (audioStreamingStarted) return;
+        audioStreamingStarted = true;
 
-          if (msg.type === 'connected') {
-            setConnectionState('connected');
-            appendOrMergeTranscript(
-              'system',
-              `Connected to Gemini Live (${msg.model}) · Voice: ${msg.voiceName}. Speak in English, Hindi, or Hinglish.`
+        setConnectionState('connected');
+        appendOrMergeTranscript(
+          'system',
+          `Connected to Gemini Live (${
+            tokenData.model || 'gemini-3.8-live'
+          }) · Voice: ${
+            tokenData.voiceName || selectedVoice
+          }. Speak in English, Hindi, or Hinglish.`
+        );
+
+        const source = inCtx.createMediaStreamSource(stream);
+        const processor = inCtx.createScriptProcessor(4096, 1, 1);
+        processorRef.current = processor;
+
+        processor.onaudioprocess = (e) => {
+          if (isMicMutedRef.current || ws.readyState !== WebSocket.OPEN) {
+            setIsUserSpeaking(false);
+            setMicLevel(0);
+            return;
+          }
+          const channelData = e.inputBuffer.getChannelData(0);
+
+          // Calculate RMS volume for live listening visualization
+          let sumSquares = 0;
+          for (let i = 0; i < channelData.length; i++) {
+            sumSquares += channelData[i] * channelData[i];
+          }
+          const rms = Math.sqrt(sumSquares / channelData.length);
+          const normalizedLevel = Math.min(1, rms * 8);
+          setMicLevel(normalizedLevel);
+          setIsUserSpeaking(rms > 0.018);
+
+          const base64Audio = float32ToPcm16Base64(channelData);
+          if (isDirectConstrained) {
+            ws.send(
+              JSON.stringify({
+                realtimeInput: {
+                  audio: {
+                    data: base64Audio,
+                    mimeType: 'audio/pcm;rate=16000',
+                  },
+                },
+              })
             );
+          } else {
+            ws.send(JSON.stringify({ type: 'audio', audio: base64Audio }));
+          }
+        };
 
-            // Start streaming 16kHz PCM microphone audio
-            const source = inCtx.createMediaStreamSource(stream);
-            const processor = inCtx.createScriptProcessor(4096, 1, 1);
-            processorRef.current = processor;
+        source.connect(processor);
+        processor.connect(inCtx.destination);
+      };
 
-            processor.onaudioprocess = (e) => {
-              if (isMicMutedRef.current || ws.readyState !== WebSocket.OPEN) {
-                setIsUserSpeaking(false);
-                setMicLevel(0);
-                return;
+      ws.onopen = () => {
+        if (isDirectConstrained && tokenData.setupPayload) {
+          ws.send(JSON.stringify(tokenData.setupPayload));
+        }
+      };
+
+      ws.onmessage = async (event) => {
+        try {
+          const rawData =
+            event.data instanceof Blob
+              ? await event.data.text()
+              : event.data instanceof ArrayBuffer
+              ? new TextDecoder().decode(event.data)
+              : String(event.data);
+
+          const msg = JSON.parse(rawData);
+
+          // Direct Gemini Live BidiGenerateContentConstrained setup confirmation
+          if (msg.setupComplete !== undefined || msg.type === 'connected') {
+            startMicAudioPipeline();
+          }
+
+          // Direct Gemini Live serverContent payload
+          const content = msg.serverContent;
+          if (content) {
+            if (content.inputTranscription?.text) {
+              appendOrMergeTranscript('user', content.inputTranscription.text);
+            }
+            if (content.outputTranscription?.text) {
+              appendOrMergeTranscript(
+                'assistant',
+                content.outputTranscription.text
+              );
+            }
+            for (const part of content.modelTurn?.parts ?? []) {
+              if (part.inlineData?.data) {
+                playPcm24kChunk(part.inlineData.data);
               }
-              const channelData = e.inputBuffer.getChannelData(0);
+            }
+            if (content.interrupted) {
+              stopAllPlayback();
+            }
+          }
 
-              // Calculate RMS volume for live listening visualization
-              let sumSquares = 0;
-              for (let i = 0; i < channelData.length; i++) {
-                sumSquares += channelData[i] * channelData[i];
+          // Direct Gemini Live Function Tool Calls
+          const functionCalls = msg.toolCall?.functionCalls ?? [];
+          if (functionCalls.length > 0) {
+            const functionResponses: any[] = [];
+
+            for (const call of functionCalls) {
+              if (call.name === 'proposeComparisonDraft' && call.args) {
+                const draftArgs = call.args as ProposedComparisonDraft;
+                setProposedDraft(draftArgs);
+                setDraftApprovedBanner(false);
+                appendOrMergeTranscript(
+                  'system',
+                  `Updated Comparison Draft: "${draftArgs.title}" (${
+                    draftArgs.options?.length || 0
+                  } options, ${
+                    draftArgs.criteria?.length || 0
+                  } criteria). Review & approve to populate the New Comparison form.`
+                );
+                functionResponses.push({
+                  id: call.id,
+                  name: call.name,
+                  response: {
+                    result:
+                      'Comparison draft displayed on screen. Now ask the user if they confirm applying this draft to their New Comparison form.',
+                  },
+                });
+              } else if (call.name === 'confirmComparisonDraft') {
+                if (Boolean(call.args?.confirmed) && latestDraftRef.current) {
+                  const converted = convertProposedDraftToComparison(
+                    latestDraftRef.current
+                  );
+                  setDraftApprovedBanner(true);
+                  onApproveDraft(converted, 'new-comparison');
+                }
+                functionResponses.push({
+                  id: call.id,
+                  name: call.name,
+                  response: {
+                    result:
+                      'Comparison draft has been confirmed and populated into the New Comparison form.',
+                  },
+                });
+              } else {
+                functionResponses.push({
+                  id: call.id,
+                  name: call.name,
+                  response: { result: 'Unknown tool' },
+                });
               }
-              const rms = Math.sqrt(sumSquares / channelData.length);
-              const normalizedLevel = Math.min(1, rms * 8);
-              setMicLevel(normalizedLevel);
-              setIsUserSpeaking(rms > 0.018);
+            }
 
-              const base64Audio = float32ToPcm16Base64(channelData);
-              ws.send(JSON.stringify({ type: 'audio', audio: base64Audio }));
-            };
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(
+                JSON.stringify({
+                  toolResponse: {
+                    functionResponses,
+                  },
+                })
+              );
+            }
+          }
 
-            source.connect(processor);
-            processor.connect(inCtx.destination);
-          } else if (msg.type === 'audio' && msg.audio) {
+          // Relay fallback message types
+          if (msg.type === 'audio' && msg.audio) {
             playPcm24kChunk(msg.audio);
           } else if (msg.type === 'input_transcription' && msg.text) {
             appendOrMergeTranscript('user', msg.text);
@@ -458,8 +622,12 @@ export const VoiceAssistantView: React.FC<VoiceAssistantViewProps> = ({
               setDraftApprovedBanner(true);
               onApproveDraft(converted, 'new-comparison');
             }
-          } else if (msg.type === 'error') {
-            setErrorMessage(msg.message || 'Gemini Live API session error.');
+          } else if (msg.type === 'error' || msg.error) {
+            setErrorMessage(
+              msg.message ||
+                msg.error?.message ||
+                'Gemini Live API session error.'
+            );
             setConnectionState('error');
           } else if (msg.type === 'session_closed') {
             setConnectionState((prev) =>
@@ -467,21 +635,29 @@ export const VoiceAssistantView: React.FC<VoiceAssistantViewProps> = ({
             );
           }
         } catch {
-          // ignore parse error
+          // ignore malformed frame
         }
       };
 
       ws.onerror = () => {
         setErrorMessage(
-          'WebSocket connection error occurred while communicating with Gemini Live server.'
+          'WebSocket connection error occurred while communicating with Gemini Live API.'
         );
         setConnectionState('error');
       };
 
-      ws.onclose = () => {
-        setConnectionState((prev) =>
-          prev === 'error' || prev === 'idle' ? prev : 'disconnected'
-        );
+      ws.onclose = (closeEvent) => {
+        setConnectionState((prev) => {
+          if (prev === 'connecting') {
+            setErrorMessage(
+              closeEvent.reason
+                ? `Gemini Live connection closed (${closeEvent.reason}).`
+                : 'Connection to Gemini Live closed before session setup completed. Please click Reconnect.'
+            );
+            return 'error';
+          }
+          return prev === 'error' || prev === 'idle' ? prev : 'disconnected';
+        });
         setIsAiSpeaking(false);
         setIsUserSpeaking(false);
       };
@@ -506,7 +682,18 @@ export const VoiceAssistantView: React.FC<VoiceAssistantViewProps> = ({
       wsRef.current &&
       wsRef.current.readyState === WebSocket.OPEN
     ) {
-      wsRef.current.send(JSON.stringify({ type: 'text', text: trimmed }));
+      const wsUrl = wsRef.current.url || '';
+      if (wsUrl.includes('generativelanguage.googleapis.com')) {
+        wsRef.current.send(
+          JSON.stringify({
+            realtimeInput: {
+              text: trimmed,
+            },
+          })
+        );
+      } else {
+        wsRef.current.send(JSON.stringify({ type: 'text', text: trimmed }));
+      }
       appendOrMergeTranscript('user', ` ${trimmed}`);
       setTextInput('');
     }
@@ -573,16 +760,18 @@ export const VoiceAssistantView: React.FC<VoiceAssistantViewProps> = ({
           <AlertCircle className="w-5 h-5 text-amber-500 shrink-0 mt-0.5" />
           <div className="text-xs space-y-1">
             <p className="font-bold text-amber-700 dark:text-amber-300">
-              GEMINI_API_KEY Setup Required in Secrets
+              GEMINI_API_KEY Setup Required
             </p>
             <p className="text-slate-600 dark:text-slate-300">
               The backend ephemeral token service could not find a valid{' '}
               <code className="font-mono text-amber-600 dark:text-amber-300">
                 GEMINI_API_KEY
               </code>
-              . Please add your Gemini API key in the AI Studio{' '}
-              <strong>Settings &gt; Secrets</strong> panel and click{' '}
-              <strong>Start Conversation</strong>.
+              . On <strong>Vercel</strong>, add{' '}
+              <code className="font-mono">GEMINI_API_KEY</code> in{' '}
+              <strong>Project Settings &gt; Environment Variables</strong> and
+              redeploy. In <strong>Google AI Studio</strong>, add it under{' '}
+              <strong>Settings &gt; Secrets</strong>.
             </p>
           </div>
         </div>

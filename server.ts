@@ -158,46 +158,23 @@ async function startServer() {
   const app = express();
   app.use(express.json());
 
-  // Health & configuration status endpoint (never exposes the key)
-  app.get('/api/live/status', (_req, res) => {
-    const configured = isApiKeyConfigured();
-    res.json({
-      configured,
-      model: 'gemini-3.8-live',
-      message: configured
-        ? 'Gemini Live API credentials are configured on the server.'
-        : 'GEMINI_API_KEY is missing in environment secrets.',
-    });
+  const { default: liveStatusHandler } = await import('./api/live/status.ts');
+  const { default: liveTokenHandler } = await import('./api/live/token.ts');
+
+  // Health & configuration status endpoint (shared with Vercel serverless /api/live/status)
+  app.all('/api/live/status', async (req, res) => {
+    await liveStatusHandler(req, res);
   });
 
-  // Short-lived Ephemeral Session Token endpoint
-  app.post('/api/live/token', async (req, res) => {
-    cleanupExpiredTokens();
+  // Short-lived Ephemeral Session Token endpoint (shared with Vercel serverless /api/live/token)
+  app.all('/api/live/token', async (req, res) => {
+    await liveTokenHandler(req, res);
+  });
 
-    if (!isApiKeyConfigured()) {
-      res.status(503).json({
-        error:
-          'GEMINI_API_KEY is not configured on the server. Please add GEMINI_API_KEY in the AI Studio Secrets panel.',
-      });
-      return;
-    }
-
-    const voiceName =
-      typeof req.body?.voiceName === 'string' &&
-      ['Zephyr', 'Puck', 'Kore', 'Charon', 'Fenrir'].includes(req.body.voiceName)
-        ? req.body.voiceName
-        : 'Zephyr';
-
-    const sessionToken = crypto.randomBytes(32).toString('hex');
-    const expiresAt = Date.now() + 5 * 60 * 1000; // 5 minutes TTL
-
-    ephemeralTokens.set(sessionToken, { expiresAt, voiceName });
-
-    res.json({
-      token: sessionToken,
-      expiresAt: new Date(expiresAt).toISOString(),
-      model: 'gemini-3.8-live',
-      voiceName,
+  // Ensure any unknown /api/* route always returns JSON, never HTML
+  app.use('/api', (req, res) => {
+    res.status(404).json({
+      error: `API endpoint not found: ${req.method} ${req.originalUrl}`,
     });
   });
 
