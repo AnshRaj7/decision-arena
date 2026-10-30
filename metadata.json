@@ -1,0 +1,6 @@
+{
+  "name": "Decision Arena",
+  "description": "Compare 2 or 3 options using custom criteria, weighted scores, radar charts, and structured side-by-side analysis.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
